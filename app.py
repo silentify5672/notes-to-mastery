@@ -58,7 +58,6 @@ def extract_text_from_pdf(uploaded_file):
 
 
 def group_by_topic(flashcards):
-    """Turns a flat list of flashcards into {topic_name: [cards...]}"""
     grouped = {}
     for card in flashcards:
         topic = card["topic"]
@@ -66,11 +65,41 @@ def group_by_topic(flashcards):
     return grouped
 
 
+def generate_quiz_questions(cards, quiz_type):
+    """
+    Takes the original flashcards for one topic and produces a fresh quiz version:
+    - reworded questions (different phrasing, same meaning)
+    - for MCQ: 4 answer options with one marked correct
+    - for open-ended: just the reworded question + original answer
+    """
+    cards_for_prompt = [{"question": c["question"], "answer": c["answer"]} for c in cards]
+
+    if quiz_type == "mcq":
+        system_prompt = (
+            "You are a quiz writer. For each flashcard given (question and answer), create a multiple-choice "
+            "quiz question: reword the question using different wording than the original while keeping the "
+            "exact same meaning. Provide exactly 4 answer options where exactly one is correct (matching the "
+            "meaning of the original answer) and the other 3 are plausible but clearly incorrect distractors. "
+            "Respond ONLY with a JSON array, one entry per flashcard, in the SAME order as given, in this exact "
+            "format: [{\"question\": \"...\", \"options\": [\"...\", \"...\", \"...\", \"...\"], "
+            "\"correct_option\": \"...\"}]. The correct_option value must exactly match one of the 4 strings "
+            "in options. No extra text, just the JSON."
+        )
+    else:
+        system_prompt = (
+            "You are a quiz writer. For each flashcard given (question and answer), reword ONLY the question "
+            "using different wording than the original while keeping the exact same meaning and the same "
+            "correct answer. Respond ONLY with a JSON array, one entry per flashcard, in the SAME order as "
+            "given, in this exact format: [{\"question\": \"...\", \"answer\": \"...\"}]. No extra text."
+        )
+
+    raw_response = call_nemotron(system_prompt, json.dumps(cards_for_prompt))
+    return json.loads(raw_response)
+
+
 def reset_quiz_state():
-    """Clears everything related to the current quiz + teach-back round,
-    so the user can pick a fresh topic to practice."""
     keys_to_clear = [
-        "quiz_topic", "quiz_cards", "quiz_index", "score", "weak_topics", "quiz_done",
+        "quiz_topic", "quiz_type", "quiz_questions", "quiz_index", "score", "weak_topics", "quiz_done",
         "tb_topic_index", "tb_stage", "tb_explanation", "tb_followup_question", "tb_verdict", "tb_done"
     ]
     for key in keys_to_clear:
@@ -106,7 +135,7 @@ if st.button("Generate Flashcards"):
             flashcards = generate_flashcards(combined_notes)
 
         st.session_state["flashcards"] = flashcards
-        reset_quiz_state()  # starting fresh flashcards means any old quiz progress is no longer valid
+        reset_quiz_state()
         st.success(f"Generated {len(flashcards)} flashcards!")
 
 # ---------- Flashcard display, grouped by topic ----------
@@ -126,7 +155,7 @@ if "flashcards" in st.session_state:
                 st.divider()
 
 
-# ---------- Quiz section: pick a topic, then quiz on just that topic ----------
+# ---------- Quiz section: pick a topic + quiz type, then quiz ----------
 
 if "flashcards" in st.session_state:
     st.divider()
@@ -139,13 +168,24 @@ if "flashcards" in st.session_state:
     idk_phrases = ["idk", "i don't know", "i dont know", "not sure", "no idea", ""]
 
     if "quiz_topic" not in st.session_state:
-        # No topic chosen yet — show the picker
+        # Step 1: pick topic and quiz type, then generate the quiz set
         st.write("Choose a topic to practice:")
         selected_topic = st.selectbox("Topic:", topic_names, key="topic_selector")
 
+        quiz_type_label = st.radio(
+            "Quiz type:",
+            options=["Open-ended", "Multiple Choice"],
+            key="quiz_type_selector"
+        )
+        quiz_type = "mcq" if quiz_type_label == "Multiple Choice" else "open"
+
         if st.button("Start Quiz on this topic"):
+            with st.spinner("Preparing your quiz questions..."):
+                quiz_questions = generate_quiz_questions(topics_grouped[selected_topic], quiz_type)
+
             st.session_state["quiz_topic"] = selected_topic
-            st.session_state["quiz_cards"] = topics_grouped[selected_topic]
+            st.session_state["quiz_type"] = quiz_type
+            st.session_state["quiz_questions"] = quiz_questions
             st.session_state["quiz_index"] = 0
             st.session_state["score"] = {"correct": 0, "incorrect": 0, "idk": 0}
             st.session_state["weak_topics"] = {}
@@ -153,48 +193,79 @@ if "flashcards" in st.session_state:
             st.rerun()
 
     else:
-        # A topic has been chosen — run the quiz on just that topic's cards
-        quiz_cards = st.session_state["quiz_cards"]
+        # Step 2: actually run the quiz
+        quiz_questions = st.session_state["quiz_questions"]
         index = st.session_state["quiz_index"]
         quiz_topic = st.session_state["quiz_topic"]
+        quiz_type = st.session_state["quiz_type"]
 
-        if not st.session_state["quiz_done"] and index < len(quiz_cards):
-            card = quiz_cards[index]
-            st.write(f"**Topic: {quiz_topic}** — Question {index + 1} of {len(quiz_cards)}")
-            st.write(card["question"])
+        if not st.session_state["quiz_done"] and index < len(quiz_questions):
+            question_data = quiz_questions[index]
+            st.write(f"**Topic: {quiz_topic}** — Question {index + 1} of {len(quiz_questions)}")
+            st.write(question_data["question"])
 
-            user_answer = st.text_input("Your answer:", key=f"answer_{index}")
+            if quiz_type == "mcq":
+                options = question_data["options"] + ["I don't know"]
+                choice = st.radio("Choose an answer:", options, key=f"mcq_{index}", index=None)
 
-            col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
 
-            if col1.button("Submit Answer", key=f"submit_{index}"):
-                if user_answer.strip().lower() in idk_phrases:
-                    st.session_state["score"]["idk"] += 1
-                    st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
-                else:
-                    grading_system_prompt = "You are grading a student's quiz answer. Given the correct answer and the student's answer, reply with ONLY the single word 'CORRECT' or 'INCORRECT' — nothing else."
-                    grading_user_prompt = f"Correct answer: {card['answer']}\nStudent's answer: {user_answer}"
-                    grading_result = call_nemotron(grading_system_prompt, grading_user_prompt)
-                    correct = grading_result.strip().upper() == "CORRECT"
-
-                    if correct:
+                if col1.button("Submit Answer", key=f"submit_{index}", disabled=(choice is None)):
+                    if choice == question_data["correct_option"]:
                         st.session_state["score"]["correct"] += 1
+                    elif choice == "I don't know":
+                        st.session_state["score"]["idk"] += 1
+                        st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
                     else:
                         st.session_state["score"]["incorrect"] += 1
                         st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
 
-                st.session_state["quiz_index"] += 1
-                st.rerun()
+                    st.session_state["quiz_index"] += 1
+                    st.rerun()
 
-            if col2.button("I don't know", key=f"idk_{index}"):
-                st.session_state["score"]["idk"] += 1
-                st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
-                st.session_state["quiz_index"] += 1
-                st.rerun()
+                if col2.button("Stop Quiz", key=f"stop_{index}"):
+                    st.session_state["quiz_done"] = True
+                    st.rerun()
 
-            if col3.button("Stop Quiz", key=f"stop_{index}"):
-                st.session_state["quiz_done"] = True
-                st.rerun()
+            else:
+                user_answer = st.text_input("Your answer:", key=f"answer_{index}")
+
+                col1, col2, col3 = st.columns(3)
+
+                if col1.button("Submit Answer", key=f"submit_{index}"):
+                    if user_answer.strip().lower() in idk_phrases:
+                        st.session_state["score"]["idk"] += 1
+                        st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
+                    else:
+                        grading_system_prompt = (
+                            "You are grading a student's quiz answer. The student's answer does NOT need to "
+                            "match word-for-word — mark it CORRECT if it captures the same key idea or meaning "
+                            "as the correct answer, even if phrased very differently, shorter, or missing minor "
+                            "details. Only mark INCORRECT if the core idea is wrong or missing. Reply with ONLY "
+                            "the single word 'CORRECT' or 'INCORRECT' — nothing else."
+                        )
+                        grading_user_prompt = f"Correct answer: {question_data['answer']}\nStudent's answer: {user_answer}"
+                        grading_result = call_nemotron(grading_system_prompt, grading_user_prompt)
+                        correct = grading_result.strip().upper() == "CORRECT"
+
+                        if correct:
+                            st.session_state["score"]["correct"] += 1
+                        else:
+                            st.session_state["score"]["incorrect"] += 1
+                            st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
+
+                    st.session_state["quiz_index"] += 1
+                    st.rerun()
+
+                if col2.button("I don't know", key=f"idk_{index}"):
+                    st.session_state["score"]["idk"] += 1
+                    st.session_state["weak_topics"][quiz_topic] = st.session_state["weak_topics"].get(quiz_topic, 0) + 1
+                    st.session_state["quiz_index"] += 1
+                    st.rerun()
+
+                if col3.button("Stop Quiz", key=f"stop_{index}"):
+                    st.session_state["quiz_done"] = True
+                    st.rerun()
 
         else:
             st.session_state["quiz_done"] = True
