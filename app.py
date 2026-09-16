@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import json
 import random
 import string
+import threading
+import time
 from pypdf import PdfReader
 
 load_dotenv()
@@ -30,6 +32,45 @@ def call_nemotron(system_prompt, user_prompt):
     response.raise_for_status()
     data = response.json()
     return data["choices"][0]["message"]["content"]
+
+
+def run_with_progress(worker_fn, label="Working..."):
+    """
+    Runs worker_fn() in a background thread while showing a simulated
+    progress bar (0-90% while waiting, snaps to 100% when actually done).
+    worker_fn takes no arguments and returns whatever result you want back.
+    """
+    result = {"data": None, "error": None}
+
+    def worker():
+        try:
+            result["data"] = worker_fn()
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    progress = 0
+
+    while thread.is_alive():
+        progress = min(progress + 3, 90)
+        progress_bar.progress(progress / 100)
+        status_text.write(f"{label} {progress}% (estimated)")
+        time.sleep(0.3)
+
+    thread.join()
+    progress_bar.progress(100)
+    status_text.write(f"{label} 100%")
+    time.sleep(0.3)
+    progress_bar.empty()
+    status_text.empty()
+
+    if result["error"] is not None:
+        raise result["error"]
+    return result["data"]
 
 
 def generate_flashcards(notes_text):
@@ -68,11 +109,6 @@ def group_by_topic(flashcards):
 
 
 def generate_quiz_questions(cards, quiz_type):
-    """
-    Reworded quiz version of the given flashcards. Attaches the ORIGINAL topic
-    back onto each generated question ourselves (not trusting the AI to echo it),
-    so weak-topic tracking stays reliable even across multi-topic review quizzes.
-    """
     cards_for_prompt = [{"question": c["question"], "answer": c["answer"]} for c in cards]
 
     if quiz_type == "mcq":
@@ -97,8 +133,6 @@ def generate_quiz_questions(cards, quiz_type):
     raw_response = call_nemotron(system_prompt, json.dumps(cards_for_prompt))
     quiz_questions = json.loads(raw_response)
 
-    # Attach the real topic back on, matched by position. If the AI returned a
-    # different number of items than expected, only pair up what safely lines up.
     safe_length = min(len(quiz_questions), len(cards))
     for i in range(safe_length):
         quiz_questions[i]["topic"] = cards[i]["topic"]
@@ -106,8 +140,6 @@ def generate_quiz_questions(cards, quiz_type):
 
 
 def reset_quiz_state():
-    """Clears just the CURRENT quiz/teach-back round — history and overall_score
-    (the long-term dashboard data) are deliberately left untouched."""
     keys_to_clear = [
         "quiz_topic", "quiz_type", "quiz_questions", "quiz_index", "score",
         "weak_topics", "quiz_done", "round_topic_results",
@@ -120,15 +152,13 @@ def reset_quiz_state():
 
 def ensure_history_initialized():
     if "history" not in st.session_state:
-        st.session_state["history"] = {}  # topic -> {"attempts": int, "mastered": bool}
+        st.session_state["history"] = {}
     if "overall_score" not in st.session_state:
         st.session_state["overall_score"] = {"correct": 0, "incorrect": 0, "idk": 0}
 
 
 @st.cache_resource
 def get_class_store():
-    """A dictionary shared across every visitor's session on this running app instance.
-    Used for Class Mode share codes. Resets if the app restarts."""
     return {}
 
 
@@ -141,7 +171,7 @@ def make_class_code():
 st.title("📚 Notes to Mastery")
 ensure_history_initialized()
 
-# ---------- Sidebar: Class Mode (join) + Progress Dashboard ----------
+# ---------- Sidebar: Class Mode + Progress Dashboard ----------
 
 with st.sidebar:
     st.header("🏫 Class Mode")
@@ -224,9 +254,10 @@ if st.button("Generate Flashcards"):
     if combined_notes == "":
         st.warning("Please paste some notes or upload at least one PDF first!")
     else:
-        with st.spinner("Generating flashcards..."):
-            flashcards = generate_flashcards(combined_notes)
-
+        flashcards = run_with_progress(
+            lambda: generate_flashcards(combined_notes),
+            label="Generating flashcards..."
+        )
         st.session_state["flashcards"] = flashcards
         reset_quiz_state()
         st.success(f"Generated {len(flashcards)} flashcards!")
@@ -290,8 +321,10 @@ if "flashcards" in st.session_state:
         quiz_type = "mcq" if quiz_type_label == "Multiple Choice" else "open"
 
         if st.button("Start Quiz"):
-            with st.spinner("Preparing your quiz questions..."):
-                quiz_questions = generate_quiz_questions(cards_for_quiz, quiz_type)
+            quiz_questions = run_with_progress(
+                lambda: generate_quiz_questions(cards_for_quiz, quiz_type),
+                label="Preparing your quiz..."
+            )
 
             st.session_state["quiz_topic"] = chosen_label
             st.session_state["quiz_type"] = quiz_type
@@ -310,7 +343,6 @@ if "flashcards" in st.session_state:
         quiz_type = st.session_state["quiz_type"]
 
         def record_result(topic, outcome):
-            """outcome: 'correct', 'incorrect', or 'idk'. Updates this round's tracking."""
             st.session_state["score"][outcome] += 1
             rtr = st.session_state["round_topic_results"]
             rtr.setdefault(topic, {"correct": 0, "wrong": 0})
@@ -354,7 +386,7 @@ if "flashcards" in st.session_state:
                     if user_answer.strip().lower() in idk_phrases:
                         record_result(topic, "idk")
                     else:
-                        with st.spinner("Grading..."):
+                        def grade():
                             grading_system_prompt = (
                                 "You are grading a student's quiz answer. The student's answer does NOT need to "
                                 "match word-for-word — mark it CORRECT if it captures the same key idea or meaning "
@@ -363,7 +395,9 @@ if "flashcards" in st.session_state:
                                 "the single word 'CORRECT' or 'INCORRECT' — nothing else."
                             )
                             grading_user_prompt = f"Correct answer: {question_data['answer']}\nStudent's answer: {user_answer}"
-                            grading_result = call_nemotron(grading_system_prompt, grading_user_prompt)
+                            return call_nemotron(grading_system_prompt, grading_user_prompt)
+
+                        grading_result = run_with_progress(grade, label="Grading your answer...")
                         correct = grading_result.strip().upper() == "CORRECT"
                         record_result(topic, "correct" if correct else "incorrect")
 
@@ -382,7 +416,6 @@ if "flashcards" in st.session_state:
         else:
             st.session_state["quiz_done"] = True
 
-            # Fold this round's results into the persistent dashboard history + overall score
             if "round_folded_in" not in st.session_state:
                 for topic, results in st.session_state["round_topic_results"].items():
                     st.session_state["history"].setdefault(topic, {"attempts": 0, "mastered": False})
@@ -432,8 +465,6 @@ if st.session_state.get("quiz_done", False) and len(st.session_state.get("weak_t
         topic = weak_topics_list[topic_index]
         st.write(f"**Topic {topic_index + 1} of {len(weak_topics_list)}: {topic}**")
 
-        # Difficulty adaptation: if this topic has been attempted multiple times
-        # before and still isn't mastered, push for a deeper follow-up question.
         past_attempts = st.session_state["history"].get(topic, {}).get("attempts", 0)
         depth_hint = (
             "This student has struggled with this topic across multiple attempts, so dig into a deeper, "
@@ -450,13 +481,60 @@ if st.session_state.get("quiz_done", False) and len(st.session_state.get("weak_t
             col1, col2 = st.columns(2)
             if col1.button("Submit Explanation", key=f"submit_explain_{topic_index}"):
                 st.session_state["tb_explanation"] = explanation
-                with st.spinner("Thinking of a follow-up question..."):
+
+                def get_followup():
                     followup_system_prompt = (
                         f"You are a curious but confused student learning about {topic}. The user just tried "
                         f"to explain it to you. Ask ONE genuine, specific follow-up question about their "
                         f"explanation, like a real confused classmate would. Keep it short and natural — no "
                         f"more than 2 sentences. {depth_hint}"
                     )
-                    followup_question = call_nemotron(followup_system_prompt, explanation)
+                    return call_nemotron(followup_system_prompt, explanation)
+
+                followup_question = run_with_progress(get_followup, label="Thinking of a follow-up question...")
                 st.session_state["tb_followup_question"] = followup_question
                 st.session_state["tb_stage"] = "followup"
+                st.rerun()
+
+            if col2.button("Skip this topic", key=f"skip_explain_{topic_index}"):
+                st.session_state["tb_topic_index"] += 1
+                st.session_state["tb_stage"] = "explain"
+                st.rerun()
+
+        elif stage == "followup":
+            st.write("🤔", st.session_state["tb_followup_question"])
+            followup_explanation = st.text_input("Your simpler explanation:", key=f"followup_{topic_index}")
+
+            col1, col2 = st.columns(2)
+            if col1.button("Submit", key=f"submit_followup_{topic_index}"):
+                def get_verdict():
+                    verdict_system_prompt = f"You are judging whether a student truly understands {topic}, based on their two explanations. Give brief, encouraging feedback (2-3 sentences) on whether their understanding seems solid or still surface-level, and why."
+                    verdict_input = f"First explanation: {st.session_state['tb_explanation']}\nFollow-up explanation: {followup_explanation}"
+                    return call_nemotron(verdict_system_prompt, verdict_input)
+
+                verdict = run_with_progress(get_verdict, label="Evaluating your understanding...")
+                st.session_state["tb_verdict"] = verdict
+                st.session_state["tb_stage"] = "verdict"
+                st.rerun()
+
+            if col2.button("Skip this topic", key=f"skip_followup_{topic_index}"):
+                st.session_state["tb_topic_index"] += 1
+                st.session_state["tb_stage"] = "explain"
+                st.rerun()
+
+        elif stage == "verdict":
+            st.write("✅", st.session_state["tb_verdict"])
+            if st.button("Next Topic", key=f"next_{topic_index}"):
+                st.session_state["tb_topic_index"] += 1
+                st.session_state["tb_stage"] = "explain"
+                st.rerun()
+
+    else:
+        st.session_state["tb_done"] = True
+        st.balloons()
+        st.success("🎉 Teach-back complete! Great work reviewing these topics.")
+        if st.button("Practice another topic"):
+            reset_quiz_state()
+            if "round_folded_in" in st.session_state:
+                del st.session_state["round_folded_in"]
+            st.rerun()
