@@ -11,6 +11,7 @@ import re
 import copy
 import uuid
 import base64
+import hashlib
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -232,10 +233,14 @@ def regenerate_flashcard(card, source_notes):
 
 # ---------- PDF text + diagram extraction ----------
 
-def extract_pdf_content(uploaded_file, filename):
+def extract_pdf_content(uploaded_file, filename, seen_hashes):
     """
     Extracts both text and qualifying embedded images from one PDF in a single pass.
     Tiny images (icons, bullets, decorative dividers) are filtered out by minimum pixel size.
+    Images that exactly match one already seen in this batch are skipped too — PDFs exported from
+    slide decks commonly embed the same template background/logo on every single page, which would
+    otherwise flood the results with copies of the same non-diagram image.
+    `seen_hashes` is a set shared across every file in the batch, mutated in place.
     Returns (text, images) where images is a list of dicts with data_b64, page_text, source, page_number.
     """
     text = ""
@@ -267,7 +272,14 @@ def extract_pdf_content(uploaded_file, filename):
 
                 buffer = BytesIO()
                 pil_image.convert("RGB").save(buffer, format="PNG")
-                data_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                png_bytes = buffer.getvalue()
+
+                image_hash = hashlib.md5(png_bytes).hexdigest()
+                if image_hash in seen_hashes:
+                    continue  # already seen this exact image — likely a repeated background/logo/watermark
+                seen_hashes.add(image_hash)
+
+                data_b64 = base64.b64encode(png_bytes).decode("utf-8")
 
                 images.append({
                     "data_b64": data_b64,
@@ -286,15 +298,16 @@ def read_all_pdfs(pdf_files):
     Reads every uploaded PDF. Returns:
     - combined text
     - list of filenames that yielded no extractable text
-    - list of qualifying embedded images (capped at MAX_IMAGES_PER_UPLOAD_BATCH)
+    - list of qualifying, deduplicated embedded images (capped at MAX_IMAGES_PER_UPLOAD_BATCH)
     - total number of qualifying images found before capping
     """
     combined = ""
     empty_files = []
     all_images = []
+    seen_hashes = set()
 
     for pdf_file in pdf_files:
-        pdf_text, pdf_images = extract_pdf_content(pdf_file, pdf_file.name)
+        pdf_text, pdf_images = extract_pdf_content(pdf_file, pdf_file.name, seen_hashes)
         if pdf_text.strip() == "":
             empty_files.append(pdf_file.name)
         else:
