@@ -10,6 +10,8 @@ import time
 import re
 import copy
 import uuid
+import base64
+from io import BytesIO
 from datetime import datetime, timedelta
 from pypdf import PdfReader
 
@@ -19,9 +21,16 @@ API_KEY = os.environ.get("NEBIUS_API_KEY")
 API_URL = "https://api.tokenfactory.nebius.com/v1/chat/completions"
 MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
 
-REQUEST_TIMEOUT = 30       # seconds per API call
-MAX_RETRIES = 2            # extra attempts after the first, on timeouts/5xx/429
-CLASS_CODE_EXPIRY_HOURS = 48  # class codes stop working after this long
+REQUEST_TIMEOUT = 30            # seconds per API call
+MAX_RETRIES = 2                 # extra attempts after the first, on timeouts/5xx/429
+CLASS_CODE_EXPIRY_HOURS = 48    # class codes stop working after this long
+
+MIN_IMAGE_DIMENSION = 120       # px — filters out tiny icons/bullets/decorative images
+MAX_IMAGES_PER_UPLOAD_BATCH = 12  # cap on how many diagram flashcards we generate per upload
+IMAGE_CARD_TOPIC = "Diagrams & Visuals"
+
+COMMONLY_MISSED_WRONG_RATE = 0.4   # 40%+ wrong across the class flags a topic as commonly misunderstood
+COMMONLY_MISSED_MIN_ANSWERS = 2    # need at least this many answers on a topic before flagging it
 
 
 # ---------- Custom errors ----------
@@ -65,7 +74,6 @@ def call_nemotron(system_prompt, user_prompt):
                 "Couldn't reach the Nebius Token Factory API (timed out or unreachable). Please try again."
             ) from e
 
-        # Rate-limited or transient server error: worth a retry
         if response.status_code == 429 or response.status_code >= 500:
             last_error = f"HTTP {response.status_code}"
             if attempt < MAX_RETRIES:
@@ -156,7 +164,7 @@ def run_with_progress(worker_fn, label="Working..."):
     return result["data"]
 
 
-# ---------- Flashcard generation ----------
+# ---------- Flashcard generation (text) ----------
 
 def generate_flashcards(notes_text):
     word_count = len(notes_text.split())
@@ -184,21 +192,32 @@ def generate_flashcards(notes_text):
 
 
 def regenerate_flashcard(card, source_notes):
-    """Ask the AI for a fresh, differently-angled flashcard on the same topic."""
-    if source_notes:
-        context = f"Original source notes (for context):\n{source_notes}\n\n"
-        user_prompt = context
+    """Ask the AI for a fresh, differently-angled Q/A pair for this card. Image cards keep their image."""
+    if card.get("image_b64"):
+        context = card.get("image_context", "")
+        system_prompt = (
+            "You are a study assistant creating a flashcard for a diagram or image. You can't see the image "
+            f"directly, but here is the surrounding page text for context. The student's current flashcard "
+            f"for this image is:\nQ: {card['question']}\nA: {card['answer']}\n\n"
+            "Write a DIFFERENT question/answer pair about the same image (a different angle or phrasing), "
+            "grounded in the context if available. Respond ONLY with a JSON object like this: "
+            "{\"question\": \"...\", \"answer\": \"...\"}. No extra text."
+        )
+        user_prompt = f"Surrounding page text:\n{context}" if context else "No surrounding text available; use your best judgment."
     else:
-        user_prompt = "No source notes are available; use your best judgment based on the topic and existing card."
+        if source_notes:
+            user_prompt = f"Original source notes (for context):\n{source_notes}\n\n"
+        else:
+            user_prompt = "No source notes are available; use your best judgment based on the topic and existing card."
 
-    system_prompt = (
-        f"You are a study assistant. The student wants a fresh version of ONE flashcard on the topic "
-        f"'{card['topic']}'. Their current flashcard is:\n"
-        f"Q: {card['question']}\nA: {card['answer']}\n\n"
-        "Write a DIFFERENT flashcard covering the same topic (a different angle, question style, or "
-        "level of detail), still grounded in the source notes if provided. "
-        "Respond ONLY with a JSON object like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
-    )
+        system_prompt = (
+            f"You are a study assistant. The student wants a fresh version of ONE flashcard on the topic "
+            f"'{card['topic']}'. Their current flashcard is:\n"
+            f"Q: {card['question']}\nA: {card['answer']}\n\n"
+            "Write a DIFFERENT flashcard covering the same topic (a different angle, question style, or "
+            "level of detail), still grounded in the source notes if provided. "
+            "Respond ONLY with a JSON object like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
+        )
 
     raw_response = call_nemotron(system_prompt, user_prompt)
     result = safe_json_parse(raw_response)
@@ -209,34 +228,130 @@ def regenerate_flashcard(card, source_notes):
     return result
 
 
-def extract_text_from_pdf(uploaded_file):
+# ---------- PDF text + diagram extraction ----------
+
+def extract_pdf_content(uploaded_file, filename):
+    """
+    Extracts both text and qualifying embedded images from one PDF in a single pass.
+    Tiny images (icons, bullets, decorative dividers) are filtered out by minimum pixel size.
+    Returns (text, images) where images is a list of dicts with data_b64, page_text, source, page_number.
+    """
+    text = ""
+    images = []
     try:
         reader = PdfReader(uploaded_file)
     except Exception:
-        return ""
+        return text, images
 
-    text = ""
-    for page in reader.pages:
+    for page_num, page in enumerate(reader.pages, start=1):
         try:
             page_text = page.extract_text()
         except Exception:
             page_text = None
         if page_text:
             text += page_text + "\n"
-    return text
+
+        try:
+            page_images = page.images
+        except Exception:
+            page_images = []
+
+        for img_file in page_images:
+            try:
+                pil_image = img_file.image
+                width, height = pil_image.size
+                if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
+                    continue  # skip small icons/bullets/decorative images
+
+                buffer = BytesIO()
+                pil_image.convert("RGB").save(buffer, format="PNG")
+                data_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+                images.append({
+                    "data_b64": data_b64,
+                    "page_text": (page_text or "")[:1500],
+                    "source": filename,
+                    "page_number": page_num,
+                })
+            except Exception:
+                continue  # skip any image that fails to decode
+
+    return text, images
 
 
 def read_all_pdfs(pdf_files):
-    """Reads every uploaded PDF, returning combined text and a list of filenames that yielded nothing."""
+    """
+    Reads every uploaded PDF. Returns:
+    - combined text
+    - list of filenames that yielded no extractable text
+    - list of qualifying embedded images (capped at MAX_IMAGES_PER_UPLOAD_BATCH)
+    - total number of qualifying images found before capping
+    """
     combined = ""
     empty_files = []
+    all_images = []
+
     for pdf_file in pdf_files:
-        pdf_text = extract_text_from_pdf(pdf_file)
+        pdf_text, pdf_images = extract_pdf_content(pdf_file, pdf_file.name)
         if pdf_text.strip() == "":
             empty_files.append(pdf_file.name)
         else:
             combined += "\n" + pdf_text
-    return combined, empty_files
+        all_images.extend(pdf_images)
+
+    total_found = len(all_images)
+    if total_found > MAX_IMAGES_PER_UPLOAD_BATCH:
+        all_images = all_images[:MAX_IMAGES_PER_UPLOAD_BATCH]
+
+    return combined, empty_files, all_images, total_found
+
+
+# ---------- Diagram flashcard generation ----------
+
+def generate_image_flashcard(image_info):
+    """
+    Given one extracted image and the text found near it on its page, ask the AI to write a
+    question/answer pair about it. The AI never sees the image itself — only the surrounding text.
+    """
+    system_prompt = (
+        "You are a study assistant creating a flashcard for a diagram or image found in the student's notes. "
+        "You can't see the image directly, but you're given the text surrounding it on the same page, which "
+        "often describes or labels it. Based on that context, write ONE flashcard whose question asks the "
+        "student to recall, label, or explain what the diagram/image shows, and whose answer gives that "
+        "explanation. If the surrounding text doesn't clearly describe the image, write a general question "
+        "like 'What does this diagram illustrate?' and give a brief, honest best-guess answer based on "
+        "context — don't invent overly specific details you can't support. Respond ONLY with a JSON object "
+        "like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
+    )
+    user_prompt = (
+        f"Surrounding page text:\n{image_info['page_text']}"
+        if image_info["page_text"]
+        else "No surrounding text was found near this image; write a general recall question about it."
+    )
+
+    raw_response = call_nemotron(system_prompt, user_prompt)
+    result = safe_json_parse(raw_response)
+
+    if not isinstance(result, dict) or "question" not in result or "answer" not in result:
+        raise FlashcardParseError("The AI didn't return a valid image flashcard.")
+
+    result["topic"] = IMAGE_CARD_TOPIC
+    result["_id"] = str(uuid.uuid4())
+    result["image_b64"] = image_info["data_b64"]
+    result["image_context"] = image_info["page_text"]
+    return result
+
+
+def generate_image_flashcards(images):
+    """Generates a flashcard per image; skips (rather than fails entirely on) any individual image that errors out."""
+    cards = []
+    for image_info in images:
+        try:
+            card = generate_image_flashcard(image_info)
+        except (FlashcardParseError, NemotronError):
+            continue
+        cards.append(card)
+    return cards
 
 
 def group_by_topic(flashcards):
@@ -246,6 +361,8 @@ def group_by_topic(flashcards):
         grouped.setdefault(topic, []).append(card)
     return grouped
 
+
+# ---------- Quiz generation ----------
 
 def get_difficulty_hint(topics, history):
     """Builds a prompt fragment nudging question difficulty based on past attempts on these topics."""
@@ -292,6 +409,7 @@ def generate_quiz_questions(cards, quiz_type, difficulty_hint=""):
     safe_length = min(len(quiz_questions), len(cards))
     for i in range(safe_length):
         quiz_questions[i]["topic"] = cards[i]["topic"]
+        quiz_questions[i]["image_b64"] = cards[i].get("image_b64")
     return quiz_questions[:safe_length]
 
 
@@ -313,12 +431,38 @@ def is_due_for_review(topic_data):
     return datetime.now() >= due_date
 
 
+# ---------- Class Mode topic-difficulty analytics ----------
+
+def compute_class_topic_difficulty(quiz_results):
+    """
+    Aggregates per-topic correct/wrong counts across every recorded attempt on a class code,
+    returning topics sorted by wrong-rate (highest first): [(topic, wrong_rate, total_answers), ...]
+    """
+    topic_totals = {}
+    for result in quiz_results:
+        for topic, counts in result.get("topic_results", {}).items():
+            totals = topic_totals.setdefault(topic, {"correct": 0, "wrong": 0})
+            totals["correct"] += counts.get("correct", 0)
+            totals["wrong"] += counts.get("wrong", 0)
+
+    difficulty = []
+    for topic, totals in topic_totals.items():
+        total = totals["correct"] + totals["wrong"]
+        if total == 0:
+            continue
+        difficulty.append((topic, totals["wrong"] / total, total))
+
+    difficulty.sort(key=lambda item: item[1], reverse=True)
+    return difficulty
+
+
 # ---------- Misc state helpers ----------
 
 def reset_quiz_state():
     keys_to_clear = [
         "quiz_topic", "quiz_type", "quiz_questions", "quiz_index", "score",
         "weak_topics", "quiz_done", "round_topic_results", "round_folded_in",
+        "confidence_log", "last_result",
         "tb_topic_index", "tb_stage", "tb_explanation", "tb_followup_question", "tb_verdict", "tb_done"
     ]
     for key in keys_to_clear:
@@ -333,6 +477,37 @@ def ensure_history_initialized():
         st.session_state["overall_score"] = {"correct": 0, "incorrect": 0, "idk": 0}
     if "active_class_code" not in st.session_state:
         st.session_state["active_class_code"] = None
+
+
+def record_result(topic, outcome, confidence=None):
+    st.session_state["score"][outcome] += 1
+    rtr = st.session_state["round_topic_results"]
+    rtr.setdefault(topic, {"correct": 0, "wrong": 0})
+    if outcome == "correct":
+        rtr[topic]["correct"] += 1
+    else:
+        rtr[topic]["wrong"] += 1
+        st.session_state["weak_topics"][topic] = st.session_state["weak_topics"].get(topic, 0) + 1
+
+    if confidence is not None:
+        st.session_state.setdefault("confidence_log", [])
+        st.session_state["confidence_log"].append({
+            "topic": topic,
+            "confidence": confidence,
+            "correct": outcome == "correct",
+        })
+
+
+def enter_reveal_mode(topic, question_text, correct_answer_text, given_answer_text, outcome):
+    """Stashes the just-answered question so the quiz UI shows a reveal/explain screen before moving on."""
+    st.session_state["last_result"] = {
+        "topic": topic,
+        "question": question_text,
+        "correct_answer": correct_answer_text,
+        "given_answer": given_answer_text,
+        "outcome": outcome,
+        "explanation": None,
+    }
 
 
 @st.cache_resource
@@ -393,6 +568,16 @@ with st.sidebar:
             if results:
                 avg = round(sum(r["score_pct"] for r in results) / len(results))
                 st.write(f"{len(results)} quiz attempt{'s' if len(results) != 1 else ''} so far — average score {avg}%")
+
+                topic_difficulty = compute_class_topic_difficulty(results)
+                commonly_missed = [
+                    t for t in topic_difficulty
+                    if t[1] >= COMMONLY_MISSED_WRONG_RATE and t[2] >= COMMONLY_MISSED_MIN_ANSWERS
+                ]
+                if commonly_missed:
+                    st.write("**📉 Commonly misunderstood (worth discussing in class):**")
+                    for topic, wrong_rate, total in commonly_missed[:5]:
+                        st.write(f"- {topic}: {round(wrong_rate * 100)}% wrong across {total} answer{'s' if total != 1 else ''}")
             else:
                 st.caption("No quiz attempts recorded yet for this set.")
 
@@ -455,7 +640,10 @@ with st.sidebar:
     st.header("📤 Export to Anki")
     if "flashcards" in st.session_state and st.session_state["flashcards"]:
         anki_lines = []
+        has_image_cards = False
         for card in st.session_state["flashcards"]:
+            if card.get("image_b64"):
+                has_image_cards = True
             front = card["question"].replace("\t", " ").replace("\n", "<br>")
             back = card["answer"].replace("\t", " ").replace("\n", "<br>")
             anki_lines.append(f"{front}\t{back}")
@@ -466,12 +654,15 @@ with st.sidebar:
             file_name="notes_to_mastery_anki_import.txt",
             mime="text/plain"
         )
-        st.caption("In Anki: File → Import, pick this file, set the field separator to Tab, and map columns to Front/Back.")
+        caption = "In Anki: File → Import, pick this file, set the field separator to Tab, and map columns to Front/Back."
+        if has_image_cards:
+            caption += " Diagram flashcards export as text only — images aren't included in this format."
+        st.caption(caption)
 
 
 # ---------- Notes / PDF input ----------
 
-st.write("Paste your notes below, or upload up to 10 PDFs, and I'll turn them into flashcards.")
+st.write("Paste your notes below, or upload up to 10 PDFs, and I'll turn them into flashcards — including any diagrams they contain.")
 
 notes_input = st.text_area("Your notes:", height=150)
 uploaded_pdfs = st.file_uploader("Or upload up to 10 PDFs:", type=["pdf"], accept_multiple_files=True)
@@ -483,9 +674,11 @@ if uploaded_pdfs and len(uploaded_pdfs) > 10:
 if st.button("Generate Flashcards"):
     combined_notes = notes_input.strip()
     empty_pdf_names = []
+    extracted_images = []
+    total_images_found = 0
 
     if uploaded_pdfs:
-        pdf_text, empty_pdf_names = run_with_progress(
+        pdf_text, empty_pdf_names, extracted_images, total_images_found = run_with_progress(
             lambda: read_all_pdfs(uploaded_pdfs),
             label="Reading PDFs..."
         )
@@ -495,6 +688,12 @@ if st.button("Generate Flashcards"):
         st.warning(
             f"No extractable text found in: {', '.join(empty_pdf_names)}. "
             "These might be scanned/image-only PDFs — try a text-based PDF or OCR them first."
+        )
+
+    if total_images_found > len(extracted_images):
+        st.caption(
+            f"Found {total_images_found} embedded images; using the first {len(extracted_images)} "
+            "for diagram flashcards to keep things quick."
         )
 
     if combined_notes == "":
@@ -510,11 +709,25 @@ if st.button("Generate Flashcards"):
         except NemotronError as e:
             st.error(f"⚠️ {e}")
         else:
+            image_cards = []
+            if extracted_images:
+                try:
+                    image_cards = run_with_progress(
+                        lambda: generate_image_flashcards(extracted_images),
+                        label=f"Creating flashcards from {len(extracted_images)} diagram(s)..."
+                    )
+                except NemotronError as e:
+                    st.warning(f"Text flashcards were created, but diagram flashcards failed: {e}")
+
+            flashcards.extend(image_cards)
+
             st.session_state["flashcards"] = flashcards
             st.session_state["source_notes"] = combined_notes
             st.session_state["active_class_code"] = None
             reset_quiz_state()
-            st.success(f"Generated {len(flashcards)} flashcards!")
+
+            img_note = f" (including {len(image_cards)} from diagrams)" if image_cards else ""
+            st.success(f"Generated {len(flashcards)} flashcards{img_note}!")
 
 # ---------- Flashcard display, grouped by topic + Class Mode create ----------
 
@@ -532,6 +745,9 @@ if "flashcards" in st.session_state:
                 editing = st.session_state.get(f"editing_{card_id}", False)
 
                 if editing:
+                    if card.get("image_b64"):
+                        st.caption("🖼️ This card includes a diagram — editing only changes the question/answer text.")
+                        st.image(base64.b64decode(card["image_b64"]), use_container_width=True)
                     new_q = st.text_area("Question:", value=card["question"], key=f"edit_q_{card_id}")
                     new_a = st.text_area("Answer:", value=card["answer"], key=f"edit_a_{card_id}")
                     col1, col2 = st.columns(2)
@@ -545,6 +761,8 @@ if "flashcards" in st.session_state:
                         st.rerun()
                 else:
                     st.write(f"**Q:** {card['question']}")
+                    if card.get("image_b64"):
+                        st.image(base64.b64decode(card["image_b64"]), use_container_width=True)
                     st.write(f"**A:** {card['answer']}")
                     col1, col2, col3 = st.columns(3)
                     if col1.button("✏️ Edit", key=f"edit_btn_{card_id}"):
@@ -593,6 +811,7 @@ if "flashcards" in st.session_state:
     topic_names = list(topics_grouped.keys())
 
     idk_phrases = ["idk", "i don't know", "i dont know", "not sure", "no idea", ""]
+    confidence_options = ["Not sure", "Somewhat confident", "Very confident"]
 
     weak_pool_topics = [t for t, d in st.session_state["history"].items() if not d["mastered"] and d["attempts"] > 0]
     due_topics = [t for t, d in st.session_state["history"].items() if is_due_for_review(d)]
@@ -642,6 +861,7 @@ if "flashcards" in st.session_state:
                 st.session_state["score"] = {"correct": 0, "incorrect": 0, "idk": 0}
                 st.session_state["weak_topics"] = {}
                 st.session_state["round_topic_results"] = {}
+                st.session_state["confidence_log"] = []
                 st.session_state["quiz_done"] = False
                 st.rerun()
 
@@ -651,81 +871,127 @@ if "flashcards" in st.session_state:
         quiz_label = st.session_state["quiz_topic"]
         quiz_type = st.session_state["quiz_type"]
 
-        def record_result(topic, outcome):
-            st.session_state["score"][outcome] += 1
-            rtr = st.session_state["round_topic_results"]
-            rtr.setdefault(topic, {"correct": 0, "wrong": 0})
-            if outcome == "correct":
-                rtr[topic]["correct"] += 1
-            else:
-                rtr[topic]["wrong"] += 1
-                st.session_state["weak_topics"][topic] = st.session_state["weak_topics"].get(topic, 0) + 1
-
         if not st.session_state["quiz_done"] and index < len(quiz_questions):
-            st.progress(index / len(quiz_questions))
-            question_data = quiz_questions[index]
-            st.write(f"**{quiz_label}** — Question {index + 1} of {len(quiz_questions)}")
-            st.write(question_data["question"])
+            last_result = st.session_state.get("last_result")
 
-            if quiz_type == "mcq":
-                options = question_data["options"] + ["I don't know"]
-                choice = st.radio("Choose an answer:", options, key=f"mcq_{index}", index=None)
+            if last_result is not None:
+                # ---------- Reveal / explain-my-mistake screen ----------
+                if last_result["outcome"] == "incorrect":
+                    st.error(f"❌ Not quite. The correct answer was: {last_result['correct_answer']}")
+                else:
+                    st.info(f"📝 No worries — here's the answer: {last_result['correct_answer']}")
 
-                col1, col2 = st.columns(2)
-                if col1.button("Submit Answer", key=f"submit_{index}", disabled=(choice is None)):
-                    topic = question_data["topic"]
-                    if choice == question_data["correct_option"]:
-                        record_result(topic, "correct")
-                    elif choice == "I don't know":
-                        record_result(topic, "idk")
-                    else:
-                        record_result(topic, "incorrect")
-                    st.session_state["quiz_index"] += 1
-                    st.rerun()
-
-                if col2.button("Stop Quiz", key=f"stop_{index}"):
-                    st.session_state["quiz_done"] = True
-                    st.rerun()
-
-            else:
-                user_answer = st.text_input("Your answer:", key=f"answer_{index}")
-                col1, col2, col3 = st.columns(3)
-
-                if col1.button("Submit Answer", key=f"submit_{index}"):
-                    topic = question_data["topic"]
-                    if user_answer.strip().lower() in idk_phrases:
-                        record_result(topic, "idk")
-                    else:
-                        def grade():
-                            grading_system_prompt = (
-                                "You are grading a student's quiz answer. The student's answer does NOT need to "
-                                "match word-for-word — mark it CORRECT if it captures the same key idea or meaning "
-                                "as the correct answer, even if phrased very differently, shorter, or missing minor "
-                                "details. Only mark INCORRECT if the core idea is wrong or missing. Reply with ONLY "
-                                "the single word 'CORRECT' or 'INCORRECT' — nothing else."
+                if last_result["explanation"] is None:
+                    button_label = "🤔 Why was I wrong?" if last_result["outcome"] == "incorrect" else "🤔 Explain this"
+                    if st.button(button_label, key=f"explain_mistake_{index}"):
+                        def get_mistake_explanation():
+                            explain_system_prompt = (
+                                f"You are a patient tutor. A student was asked: '{last_result['question']}'. "
+                                f"The correct answer is: '{last_result['correct_answer']}'. "
+                                f"The student answered: '{last_result['given_answer']}'. "
+                                "In 2-3 short, encouraging sentences, explain WHY the correct answer is right "
+                                "and, if relevant, why the student's answer likely missed the mark. Be specific "
+                                "and concrete, not generic."
                             )
-                            grading_user_prompt = f"Correct answer: {question_data['answer']}\nStudent's answer: {user_answer}"
-                            return call_nemotron(grading_system_prompt, grading_user_prompt)
+                            return call_nemotron(explain_system_prompt, "Explain the mistake.")
 
                         try:
-                            grading_result = run_with_progress(grade, label="Grading your answer...")
+                            explanation = run_with_progress(get_mistake_explanation, label="Working out an explanation...")
                         except NemotronError as e:
                             st.error(f"⚠️ {e}")
-                            st.stop()
-                        correct = grading_result.strip().upper() == "CORRECT"
-                        record_result(topic, "correct" if correct else "incorrect")
+                        else:
+                            st.session_state["last_result"]["explanation"] = explanation
+                            st.rerun()
+                else:
+                    st.write("💡", last_result["explanation"])
 
+                if st.button("Next Question ➡️", key=f"next_q_{index}"):
+                    st.session_state["last_result"] = None
                     st.session_state["quiz_index"] += 1
                     st.rerun()
 
-                if col2.button("I don't know", key=f"idk_{index}"):
-                    record_result(question_data["topic"], "idk")
-                    st.session_state["quiz_index"] += 1
-                    st.rerun()
+            else:
+                # ---------- Normal question rendering ----------
+                st.progress(index / len(quiz_questions))
+                question_data = quiz_questions[index]
+                st.write(f"**{quiz_label}** — Question {index + 1} of {len(quiz_questions)}")
+                st.write(question_data["question"])
+                if question_data.get("image_b64"):
+                    st.image(base64.b64decode(question_data["image_b64"]), use_container_width=True)
 
-                if col3.button("Stop Quiz", key=f"stop_{index}"):
-                    st.session_state["quiz_done"] = True
-                    st.rerun()
+                confidence = st.select_slider(
+                    "How confident are you?",
+                    options=confidence_options,
+                    value="Somewhat confident",
+                    key=f"confidence_{index}"
+                )
+
+                if quiz_type == "mcq":
+                    options = question_data["options"] + ["I don't know"]
+                    choice = st.radio("Choose an answer:", options, key=f"mcq_{index}", index=None)
+
+                    col1, col2 = st.columns(2)
+                    if col1.button("Submit Answer", key=f"submit_{index}", disabled=(choice is None)):
+                        topic = question_data["topic"]
+                        if choice == question_data["correct_option"]:
+                            record_result(topic, "correct", confidence)
+                            st.session_state["quiz_index"] += 1
+                        elif choice == "I don't know":
+                            record_result(topic, "idk", confidence)
+                            enter_reveal_mode(topic, question_data["question"], question_data["correct_option"], choice, "idk")
+                        else:
+                            record_result(topic, "incorrect", confidence)
+                            enter_reveal_mode(topic, question_data["question"], question_data["correct_option"], choice, "incorrect")
+                        st.rerun()
+
+                    if col2.button("Stop Quiz", key=f"stop_{index}"):
+                        st.session_state["quiz_done"] = True
+                        st.rerun()
+
+                else:
+                    user_answer = st.text_input("Your answer:", key=f"answer_{index}")
+                    col1, col2, col3 = st.columns(3)
+
+                    if col1.button("Submit Answer", key=f"submit_{index}"):
+                        topic = question_data["topic"]
+                        if user_answer.strip().lower() in idk_phrases:
+                            record_result(topic, "idk", "Not sure")
+                            enter_reveal_mode(topic, question_data["question"], question_data["answer"], user_answer, "idk")
+                            st.rerun()
+                        else:
+                            def grade():
+                                grading_system_prompt = (
+                                    "You are grading a student's quiz answer. The student's answer does NOT need to "
+                                    "match word-for-word — mark it CORRECT if it captures the same key idea or meaning "
+                                    "as the correct answer, even if phrased very differently, shorter, or missing minor "
+                                    "details. Only mark INCORRECT if the core idea is wrong or missing. Reply with ONLY "
+                                    "the single word 'CORRECT' or 'INCORRECT' — nothing else."
+                                )
+                                grading_user_prompt = f"Correct answer: {question_data['answer']}\nStudent's answer: {user_answer}"
+                                return call_nemotron(grading_system_prompt, grading_user_prompt)
+
+                            try:
+                                grading_result = run_with_progress(grade, label="Grading your answer...")
+                            except NemotronError as e:
+                                st.error(f"⚠️ {e}")
+                                st.stop()
+
+                            correct = grading_result.strip().upper() == "CORRECT"
+                            record_result(topic, "correct" if correct else "incorrect", confidence)
+                            if correct:
+                                st.session_state["quiz_index"] += 1
+                            else:
+                                enter_reveal_mode(topic, question_data["question"], question_data["answer"], user_answer, "incorrect")
+                            st.rerun()
+
+                    if col2.button("I don't know", key=f"idk_{index}"):
+                        record_result(question_data["topic"], "idk", "Not sure")
+                        enter_reveal_mode(question_data["topic"], question_data["question"], question_data["answer"], "(no answer given)", "idk")
+                        st.rerun()
+
+                    if col3.button("Stop Quiz", key=f"stop_{index}"):
+                        st.session_state["quiz_done"] = True
+                        st.rerun()
 
         else:
             st.session_state["quiz_done"] = True
@@ -752,7 +1018,8 @@ if "flashcards" in st.session_state:
                         pct = round((score["correct"] / total) * 100) if total > 0 else 0
                         store[active_code]["quiz_results"].append({
                             "score_pct": pct,
-                            "timestamp": datetime.now().isoformat()
+                            "timestamp": datetime.now().isoformat(),
+                            "topic_results": st.session_state["round_topic_results"],
                         })
 
                 st.session_state["round_folded_in"] = True
@@ -762,6 +1029,21 @@ if "flashcards" in st.session_state:
             percentage = round((score["correct"] / total) * 100) if total > 0 else 0
 
             st.success(f"📊 Quiz complete on **{quiz_label}**! {score['correct']} correct, {score['incorrect']} incorrect, {score['idk']} idk — {percentage}%")
+
+            confidence_log = st.session_state.get("confidence_log", [])
+            if confidence_log:
+                high_conf_wrong = [c for c in confidence_log if c["confidence"] == "Very confident" and not c["correct"]]
+                low_conf_right = [c for c in confidence_log if c["confidence"] == "Not sure" and c["correct"]]
+                if high_conf_wrong:
+                    st.info(
+                        f"🎯 You were **very confident but wrong** on {len(high_conf_wrong)} question(s) — "
+                        "those topics might deserve a closer look, since they may feel more solid than they are."
+                    )
+                if low_conf_right:
+                    st.info(
+                        f"💡 You got {len(low_conf_right)} question(s) right even though you weren't sure — "
+                        "trust yourself a bit more on those!"
+                    )
 
             if len(st.session_state["weak_topics"]) == 0:
                 st.success("🎉 No weak spots here — great job!")
