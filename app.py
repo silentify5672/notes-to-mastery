@@ -10,10 +10,6 @@ import time
 import re
 import copy
 import uuid
-import base64
-import hashlib
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pypdf import PdfReader
 
@@ -26,11 +22,6 @@ MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
 REQUEST_TIMEOUT = 30            # seconds per API call
 MAX_RETRIES = 2                 # extra attempts after the first, on timeouts/5xx/429
 CLASS_CODE_EXPIRY_HOURS = 48    # class codes stop working after this long
-
-MIN_IMAGE_DIMENSION = 120       # px — filters out tiny icons/bullets/decorative images
-MAX_IMAGES_PER_UPLOAD_BATCH = 12  # cap on how many diagram flashcards we generate per upload
-IMAGE_FLASHCARD_WORKERS = 5       # how many diagram flashcards to generate in parallel
-IMAGE_CARD_TOPIC = "Diagrams & Visuals"
 
 COMMONLY_MISSED_WRONG_RATE = 0.4   # 40%+ wrong across the class flags a topic as commonly misunderstood
 COMMONLY_MISSED_MIN_ANSWERS = 2    # need at least this many answers on a topic before flagging it
@@ -195,32 +186,20 @@ def generate_flashcards(notes_text):
 
 
 def regenerate_flashcard(card, source_notes):
-    """Ask the AI for a fresh, differently-angled Q/A pair for this card. Image cards keep their image."""
-    if card.get("image_b64"):
-        context = card.get("image_context", "")
-        system_prompt = (
-            "You are a study assistant creating a flashcard for a diagram or image. You can't see the image "
-            f"directly, but here is the surrounding page text for context. The student's current flashcard "
-            f"for this image is:\nQ: {card['question']}\nA: {card['answer']}\n\n"
-            "Write a DIFFERENT question/answer pair about the same image (a different angle or phrasing), "
-            "grounded in the context if available. Respond ONLY with a JSON object like this: "
-            "{\"question\": \"...\", \"answer\": \"...\"}. No extra text."
-        )
-        user_prompt = f"Surrounding page text:\n{context}" if context else "No surrounding text available; use your best judgment."
+    """Ask the AI for a fresh, differently-angled Q/A pair for this card."""
+    if source_notes:
+        user_prompt = f"Original source notes (for context):\n{source_notes}\n\n"
     else:
-        if source_notes:
-            user_prompt = f"Original source notes (for context):\n{source_notes}\n\n"
-        else:
-            user_prompt = "No source notes are available; use your best judgment based on the topic and existing card."
+        user_prompt = "No source notes are available; use your best judgment based on the topic and existing card."
 
-        system_prompt = (
-            f"You are a study assistant. The student wants a fresh version of ONE flashcard on the topic "
-            f"'{card['topic']}'. Their current flashcard is:\n"
-            f"Q: {card['question']}\nA: {card['answer']}\n\n"
-            "Write a DIFFERENT flashcard covering the same topic (a different angle, question style, or "
-            "level of detail), still grounded in the source notes if provided. "
-            "Respond ONLY with a JSON object like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
-        )
+    system_prompt = (
+        f"You are a study assistant. The student wants a fresh version of ONE flashcard on the topic "
+        f"'{card['topic']}'. Their current flashcard is:\n"
+        f"Q: {card['question']}\nA: {card['answer']}\n\n"
+        "Write a DIFFERENT flashcard covering the same topic (a different angle, question style, or "
+        "level of detail), still grounded in the source notes if provided. "
+        "Respond ONLY with a JSON object like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
+    )
 
     raw_response = call_nemotron(system_prompt, user_prompt)
     result = safe_json_parse(raw_response)
@@ -233,150 +212,34 @@ def regenerate_flashcard(card, source_notes):
 
 # ---------- PDF text + diagram extraction ----------
 
-def extract_pdf_content(uploaded_file, filename, seen_hashes):
-    """
-    Extracts both text and qualifying embedded images from one PDF in a single pass.
-    Tiny images (icons, bullets, decorative dividers) are filtered out by minimum pixel size.
-    Images that exactly match one already seen in this batch are skipped too — PDFs exported from
-    slide decks commonly embed the same template background/logo on every single page, which would
-    otherwise flood the results with copies of the same non-diagram image.
-    `seen_hashes` is a set shared across every file in the batch, mutated in place.
-    Returns (text, images) where images is a list of dicts with data_b64, page_text, source, page_number.
-    """
-    text = ""
-    images = []
+def extract_text_from_pdf(uploaded_file):
     try:
         reader = PdfReader(uploaded_file)
     except Exception:
-        return text, images
+        return ""
 
-    for page_num, page in enumerate(reader.pages, start=1):
+    text = ""
+    for page in reader.pages:
         try:
             page_text = page.extract_text()
         except Exception:
             page_text = None
         if page_text:
             text += page_text + "\n"
-
-        try:
-            page_images = page.images
-        except Exception:
-            page_images = []
-
-        for img_file in page_images:
-            try:
-                pil_image = img_file.image
-                width, height = pil_image.size
-                if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
-                    continue  # skip small icons/bullets/decorative images
-
-                buffer = BytesIO()
-                pil_image.convert("RGB").save(buffer, format="PNG")
-                png_bytes = buffer.getvalue()
-
-                image_hash = hashlib.md5(png_bytes).hexdigest()
-                if image_hash in seen_hashes:
-                    continue  # already seen this exact image — likely a repeated background/logo/watermark
-                seen_hashes.add(image_hash)
-
-                data_b64 = base64.b64encode(png_bytes).decode("utf-8")
-
-                images.append({
-                    "data_b64": data_b64,
-                    "page_text": (page_text or "")[:1500],
-                    "source": filename,
-                    "page_number": page_num,
-                })
-            except Exception:
-                continue  # skip any image that fails to decode
-
-    return text, images
+    return text
 
 
 def read_all_pdfs(pdf_files):
-    """
-    Reads every uploaded PDF. Returns:
-    - combined text
-    - list of filenames that yielded no extractable text
-    - list of qualifying, deduplicated embedded images (capped at MAX_IMAGES_PER_UPLOAD_BATCH)
-    - total number of qualifying images found before capping
-    """
+    """Reads every uploaded PDF, returning combined text and a list of filenames that yielded nothing."""
     combined = ""
     empty_files = []
-    all_images = []
-    seen_hashes = set()
-
     for pdf_file in pdf_files:
-        pdf_text, pdf_images = extract_pdf_content(pdf_file, pdf_file.name, seen_hashes)
+        pdf_text = extract_text_from_pdf(pdf_file)
         if pdf_text.strip() == "":
             empty_files.append(pdf_file.name)
         else:
             combined += "\n" + pdf_text
-        all_images.extend(pdf_images)
-
-    total_found = len(all_images)
-    if total_found > MAX_IMAGES_PER_UPLOAD_BATCH:
-        all_images = all_images[:MAX_IMAGES_PER_UPLOAD_BATCH]
-
-    return combined, empty_files, all_images, total_found
-
-
-# ---------- Diagram flashcard generation ----------
-
-def generate_image_flashcard(image_info):
-    """
-    Given one extracted image and the text found near it on its page, ask the AI to write a
-    question/answer pair about it. The AI never sees the image itself — only the surrounding text.
-    """
-    system_prompt = (
-        "You are a study assistant creating a flashcard for a diagram or image found in the student's notes. "
-        "You can't see the image directly, but you're given the text surrounding it on the same page, which "
-        "often describes or labels it. Based on that context, write ONE flashcard whose question asks the "
-        "student to recall, label, or explain what the diagram/image shows, and whose answer gives that "
-        "explanation. If the surrounding text doesn't clearly describe the image, write a general question "
-        "like 'What does this diagram illustrate?' and give a brief, honest best-guess answer based on "
-        "context — don't invent overly specific details you can't support. Respond ONLY with a JSON object "
-        "like this: {\"question\": \"...\", \"answer\": \"...\"}. No extra text."
-    )
-    user_prompt = (
-        f"Surrounding page text:\n{image_info['page_text']}"
-        if image_info["page_text"]
-        else "No surrounding text was found near this image; write a general recall question about it."
-    )
-
-    raw_response = call_nemotron(system_prompt, user_prompt)
-    result = safe_json_parse(raw_response)
-
-    if not isinstance(result, dict) or "question" not in result or "answer" not in result:
-        raise FlashcardParseError("The AI didn't return a valid image flashcard.")
-
-    result["topic"] = IMAGE_CARD_TOPIC
-    result["_id"] = str(uuid.uuid4())
-    result["image_b64"] = image_info["data_b64"]
-    result["image_context"] = image_info["page_text"]
-    return result
-
-
-def generate_image_flashcards(images):
-    """
-    Generates a flashcard per image, running several AI calls at once instead of one at a time —
-    each image's flashcard is independent, so this is a straightforward speed win.
-    Skips (rather than fails entirely on) any individual image that errors out.
-    """
-    if not images:
-        return []
-
-    def safe_generate(image_info):
-        try:
-            return generate_image_flashcard(image_info)
-        except (FlashcardParseError, NemotronError):
-            return None
-
-    worker_count = min(IMAGE_FLASHCARD_WORKERS, len(images))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        results = list(executor.map(safe_generate, images))
-
-    return [card for card in results if card is not None]
+    return combined, empty_files
 
 
 def group_by_topic(flashcards):
@@ -434,7 +297,6 @@ def generate_quiz_questions(cards, quiz_type, difficulty_hint=""):
     safe_length = min(len(quiz_questions), len(cards))
     for i in range(safe_length):
         quiz_questions[i]["topic"] = cards[i]["topic"]
-        quiz_questions[i]["image_b64"] = cards[i].get("image_b64")
     return quiz_questions[:safe_length]
 
 
@@ -665,10 +527,7 @@ with st.sidebar:
     st.header("📤 Export to Anki")
     if "flashcards" in st.session_state and st.session_state["flashcards"]:
         anki_lines = []
-        has_image_cards = False
         for card in st.session_state["flashcards"]:
-            if card.get("image_b64"):
-                has_image_cards = True
             front = card["question"].replace("\t", " ").replace("\n", "<br>")
             back = card["answer"].replace("\t", " ").replace("\n", "<br>")
             anki_lines.append(f"{front}\t{back}")
@@ -679,15 +538,12 @@ with st.sidebar:
             file_name="notes_to_mastery_anki_import.txt",
             mime="text/plain"
         )
-        caption = "In Anki: File → Import, pick this file, set the field separator to Tab, and map columns to Front/Back."
-        if has_image_cards:
-            caption += " Diagram flashcards export as text only — images aren't included in this format."
-        st.caption(caption)
+        st.caption("In Anki: File → Import, pick this file, set the field separator to Tab, and map columns to Front/Back.")
 
 
 # ---------- Notes / PDF input ----------
 
-st.write("Paste your notes below, or upload up to 10 PDFs, and I'll turn them into flashcards — including any diagrams they contain.")
+st.write("Paste your notes below, or upload up to 10 PDFs, and I'll turn them into flashcards.")
 
 notes_input = st.text_area("Your notes:", height=150)
 uploaded_pdfs = st.file_uploader("Or upload up to 10 PDFs:", type=["pdf"], accept_multiple_files=True)
@@ -696,39 +552,21 @@ if uploaded_pdfs and len(uploaded_pdfs) > 10:
     st.warning("You can upload up to 10 PDFs at a time — only the first 10 will be used.")
     uploaded_pdfs = uploaded_pdfs[:10]
 
-generate_diagrams = st.checkbox(
-    "Also generate flashcards from diagrams in PDFs",
-    value=True,
-    help="Turn this off for faster generation if you don't need diagram flashcards — each diagram needs its own AI call, so this is the slowest part of the process.",
-    key="generate_diagrams_toggle"
-)
-
 if st.button("Generate Flashcards"):
     combined_notes = notes_input.strip()
     empty_pdf_names = []
-    extracted_images = []
-    total_images_found = 0
 
     if uploaded_pdfs:
-        pdf_text, empty_pdf_names, extracted_images, total_images_found = run_with_progress(
+        pdf_text, empty_pdf_names = run_with_progress(
             lambda: read_all_pdfs(uploaded_pdfs),
             label="Reading PDFs..."
         )
         combined_notes = (combined_notes + "\n" + pdf_text).strip()
 
-    if not generate_diagrams:
-        extracted_images = []  # user opted out — skip diagram flashcard generation entirely
-
     if empty_pdf_names:
         st.warning(
             f"No extractable text found in: {', '.join(empty_pdf_names)}. "
             "These might be scanned/image-only PDFs — try a text-based PDF or OCR them first."
-        )
-
-    if generate_diagrams and total_images_found > len(extracted_images):
-        st.caption(
-            f"Found {total_images_found} embedded images; using the first {len(extracted_images)} "
-            "for diagram flashcards to keep things quick."
         )
 
     if combined_notes == "":
@@ -744,25 +582,11 @@ if st.button("Generate Flashcards"):
         except NemotronError as e:
             st.error(f"⚠️ {e}")
         else:
-            image_cards = []
-            if extracted_images:
-                try:
-                    image_cards = run_with_progress(
-                        lambda: generate_image_flashcards(extracted_images),
-                        label=f"Creating flashcards from {len(extracted_images)} diagram(s)..."
-                    )
-                except NemotronError as e:
-                    st.warning(f"Text flashcards were created, but diagram flashcards failed: {e}")
-
-            flashcards.extend(image_cards)
-
             st.session_state["flashcards"] = flashcards
             st.session_state["source_notes"] = combined_notes
             st.session_state["active_class_code"] = None
             reset_quiz_state()
-
-            img_note = f" (including {len(image_cards)} from diagrams)" if image_cards else ""
-            st.success(f"Generated {len(flashcards)} flashcards{img_note}!")
+            st.success(f"Generated {len(flashcards)} flashcards!")
 
 # ---------- Flashcard display, grouped by topic + Class Mode create ----------
 
@@ -780,9 +604,6 @@ if "flashcards" in st.session_state:
                 editing = st.session_state.get(f"editing_{card_id}", False)
 
                 if editing:
-                    if card.get("image_b64"):
-                        st.caption("🖼️ This card includes a diagram — editing only changes the question/answer text.")
-                        st.image(base64.b64decode(card["image_b64"]), use_container_width=True)
                     new_q = st.text_area("Question:", value=card["question"], key=f"edit_q_{card_id}")
                     new_a = st.text_area("Answer:", value=card["answer"], key=f"edit_a_{card_id}")
                     col1, col2 = st.columns(2)
@@ -796,8 +617,6 @@ if "flashcards" in st.session_state:
                         st.rerun()
                 else:
                     st.write(f"**Q:** {card['question']}")
-                    if card.get("image_b64"):
-                        st.image(base64.b64decode(card["image_b64"]), use_container_width=True)
                     st.write(f"**A:** {card['answer']}")
                     col1, col2, col3 = st.columns(3)
                     if col1.button("✏️ Edit", key=f"edit_btn_{card_id}"):
@@ -951,8 +770,6 @@ if "flashcards" in st.session_state:
                 question_data = quiz_questions[index]
                 st.write(f"**{quiz_label}** — Question {index + 1} of {len(quiz_questions)}")
                 st.write(question_data["question"])
-                if question_data.get("image_b64"):
-                    st.image(base64.b64decode(question_data["image_b64"]), use_container_width=True)
 
                 confidence = st.select_slider(
                     "How confident are you?",
