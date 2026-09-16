@@ -12,6 +12,7 @@ import copy
 import uuid
 import base64
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pypdf import PdfReader
 
@@ -27,6 +28,7 @@ CLASS_CODE_EXPIRY_HOURS = 48    # class codes stop working after this long
 
 MIN_IMAGE_DIMENSION = 120       # px — filters out tiny icons/bullets/decorative images
 MAX_IMAGES_PER_UPLOAD_BATCH = 12  # cap on how many diagram flashcards we generate per upload
+IMAGE_FLASHCARD_WORKERS = 5       # how many diagram flashcards to generate in parallel
 IMAGE_CARD_TOPIC = "Diagrams & Visuals"
 
 COMMONLY_MISSED_WRONG_RATE = 0.4   # 40%+ wrong across the class flags a topic as commonly misunderstood
@@ -343,15 +345,25 @@ def generate_image_flashcard(image_info):
 
 
 def generate_image_flashcards(images):
-    """Generates a flashcard per image; skips (rather than fails entirely on) any individual image that errors out."""
-    cards = []
-    for image_info in images:
+    """
+    Generates a flashcard per image, running several AI calls at once instead of one at a time —
+    each image's flashcard is independent, so this is a straightforward speed win.
+    Skips (rather than fails entirely on) any individual image that errors out.
+    """
+    if not images:
+        return []
+
+    def safe_generate(image_info):
         try:
-            card = generate_image_flashcard(image_info)
+            return generate_image_flashcard(image_info)
         except (FlashcardParseError, NemotronError):
-            continue
-        cards.append(card)
-    return cards
+            return None
+
+    worker_count = min(IMAGE_FLASHCARD_WORKERS, len(images))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(safe_generate, images))
+
+    return [card for card in results if card is not None]
 
 
 def group_by_topic(flashcards):
@@ -671,6 +683,13 @@ if uploaded_pdfs and len(uploaded_pdfs) > 10:
     st.warning("You can upload up to 10 PDFs at a time — only the first 10 will be used.")
     uploaded_pdfs = uploaded_pdfs[:10]
 
+generate_diagrams = st.checkbox(
+    "Also generate flashcards from diagrams in PDFs",
+    value=True,
+    help="Turn this off for faster generation if you don't need diagram flashcards — each diagram needs its own AI call, so this is the slowest part of the process.",
+    key="generate_diagrams_toggle"
+)
+
 if st.button("Generate Flashcards"):
     combined_notes = notes_input.strip()
     empty_pdf_names = []
@@ -684,13 +703,16 @@ if st.button("Generate Flashcards"):
         )
         combined_notes = (combined_notes + "\n" + pdf_text).strip()
 
+    if not generate_diagrams:
+        extracted_images = []  # user opted out — skip diagram flashcard generation entirely
+
     if empty_pdf_names:
         st.warning(
             f"No extractable text found in: {', '.join(empty_pdf_names)}. "
             "These might be scanned/image-only PDFs — try a text-based PDF or OCR them first."
         )
 
-    if total_images_found > len(extracted_images):
+    if generate_diagrams and total_images_found > len(extracted_images):
         st.caption(
             f"Found {total_images_found} embedded images; using the first {len(extracted_images)} "
             "for diagram flashcards to keep things quick."
